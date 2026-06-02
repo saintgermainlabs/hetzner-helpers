@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# provision/users — create a user on a Hetzner dedicated server (booted into
+# rescue mode) and install the *current local user's* SSH public keys as that
+# user's authorized_keys.
+#
+# It takes your current local username (whoami) by default, creates a matching
+# user inside the installed system (mounted + chrooted from rescue), grants
+# sudo, and copies every public key in ~/.ssh/*.pub into authorized_keys.
+#
+# Usage:
+#   ./provision/users                 # user = $(whoami), host/part from defaults below
+#   ./provision/users alice           # create user 'alice' instead
+#   ./provision/users alice root@1.2.3.4
+#
+# Or source it and call the function directly:
+#   source provision/users && provision_user dom
+#
+set -euo pipefail
+
+# --- Defaults (override via environment) ------------------------------------
+RESCUE_HOST="${RESCUE_HOST:-root@162.55.242.179}"   # rescue SSH target
+ROOT_PART="${ROOT_PART:-/dev/md2}"                  # installed-system root (this server uses RAID1 md2)
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_server}"  # key that logs into rescue
+GRANT_SUDO="${GRANT_SUDO:-true}"                    # add to sudo group + NOPASSWD drop-in
+
+provision_user() {
+    local new_user="${1:-$(whoami)}"
+    local rescue_host="${2:-$RESCUE_HOST}"
+
+    # 1. Collect every public key belonging to the current local user.
+    local pubkeys
+    pubkeys="$(cat "$HOME"/.ssh/*.pub 2>/dev/null || true)"
+    if [[ -z "${pubkeys//[$'\n\t ']/}" ]]; then
+        echo "No public keys found in $HOME/.ssh/*.pub — nothing to install." >&2
+        return 1
+    fi
+    local key_count
+    key_count="$(printf '%s\n' "$pubkeys" | grep -cve '^[[:space:]]*$' || true)"
+
+    # Encode keys to a single safe token so newlines/comments survive the SSH arg.
+    local keys_b64
+    keys_b64="$(printf '%s\n' "$pubkeys" | base64 -w0)"
+
+    echo "Provisioning '$new_user' on $rescue_host (root=$ROOT_PART) with $key_count key(s)..."
+
+    # 2. Do the work inside the chrooted installed system, on the rescue host.
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$rescue_host" \
+        "NEW_USER='$new_user' ROOT_PART='$ROOT_PART' GRANT_SUDO='$GRANT_SUDO' KEYS_B64='$keys_b64' bash -s" <<'REMOTE'
+set -euo pipefail
+: "${NEW_USER:?}" "${ROOT_PART:?}"
+
+# Mount the installed system if it isn't already mounted at /mnt.
+if ! mountpoint -q /mnt; then
+    mount "$ROOT_PART" /mnt
+fi
+for d in dev proc sys; do
+    mountpoint -q "/mnt/$d" || mount --bind "/$d" "/mnt/$d"
+done
+
+# Create the user (idempotent).
+if ! chroot /mnt id -u "$NEW_USER" >/dev/null 2>&1; then
+    chroot /mnt useradd -m -s /bin/bash "$NEW_USER"
+    echo "  created user $NEW_USER"
+else
+    echo "  user $NEW_USER already exists — updating keys"
+fi
+
+# Grant sudo (Debian 'sudo' group, fall back to 'wheel') + passwordless drop-in,
+# since a key-only account has a locked password and sudo would otherwise prompt.
+if [[ "$GRANT_SUDO" == "true" ]]; then
+    chroot /mnt usermod -aG sudo "$NEW_USER" 2>/dev/null \
+        || chroot /mnt usermod -aG wheel "$NEW_USER" 2>/dev/null || true
+    echo "$NEW_USER ALL=(ALL) NOPASSWD:ALL" > "/mnt/etc/sudoers.d/90-$NEW_USER"
+    chmod 440 "/mnt/etc/sudoers.d/90-$NEW_USER"
+fi
+
+# Install authorized_keys with correct perms/ownership.
+install -d -m 700 "/mnt/home/$NEW_USER/.ssh"
+printf '%s' "$KEYS_B64" | base64 -d > "/mnt/home/$NEW_USER/.ssh/authorized_keys"
+chmod 600 "/mnt/home/$NEW_USER/.ssh/authorized_keys"
+chroot /mnt chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER/.ssh"
+
+installed="$(grep -cve '^[[:space:]]*$' "/mnt/home/$NEW_USER/.ssh/authorized_keys" || true)"
+echo "  installed $installed key(s) -> /home/$NEW_USER/.ssh/authorized_keys"
+echo "Done: $NEW_USER ready. After reboot to disk: ssh $NEW_USER@<server-ip>"
+REMOTE
+}
+
+permit_root_login() {
+    local rescue_host="${1:-$RESCUE_HOST}"
+
+    echo "Enabling root SSH login on $rescue_host (root=$ROOT_PART)..."
+
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$rescue_host" \
+        "ROOT_PART='$ROOT_PART' bash -s" <<'REMOTE'
+set -euo pipefail
+: "${ROOT_PART:?}"
+
+# Mount the installed system if it isn't already mounted at /mnt.
+if ! mountpoint -q /mnt; then
+    mount "$ROOT_PART" /mnt
+fi
+
+CFG=/mnt/etc/ssh/sshd_config
+cp -a "$CFG" "$CFG.bak.$(cat /proc/sys/kernel/random/uuid | cut -c1-8)" 2>/dev/null || cp -a "$CFG" "$CFG.bak"
+
+# Comment out any existing PermitRootLogin directives so ours is authoritative.
+sed -i -E 's/^([[:space:]]*PermitRootLogin[[:space:]].*)$/#\1/I' "$CFG"
+echo "PermitRootLogin yes" >> "$CFG"
+
+# Drop-in configs (e.g. cloud-init) can override the main file — neutralize them.
+shopt -s nullglob
+for f in /mnt/etc/ssh/sshd_config.d/*.conf; do
+    if grep -qiE '^[[:space:]]*PermitRootLogin' "$f"; then
+        sed -i -E 's/^([[:space:]]*PermitRootLogin[[:space:]].*)$/#\1/I' "$f"
+        echo "  neutralized PermitRootLogin in $(basename "$f")"
+    fi
+done
+
+echo "  set PermitRootLogin yes in /etc/ssh/sshd_config (backup saved alongside)"
+echo "Done. Takes effect after reboot to disk (or 'systemctl restart ssh' on the live system)."
+REMOTE
+}
+
+# Run directly when executed (not when sourced).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    provision_user "$@"
+fi
