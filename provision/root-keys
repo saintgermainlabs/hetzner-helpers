@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#
+# provision/root-keys — install local SSH public keys as root's authorized_keys
+# on the installed system (via rescue chroot). Typical fix when you lost SSH keys.
+#
+# Requires a server already in rescue mode (see: hetzner-rescue recover).
+# Full walkthrough: docs/recovery.md
+#
+# Usage:
+#   RESCUE_HOST=root@1.2.3.4 ROOT_PART=/dev/md2 ./provision/root-keys
+#   RESCUE_HOST=root@1.2.3.4 ./provision/root-keys --list-parts
+#   ./provision/root-keys root@1.2.3.4
+#   PERMIT_ROOT_LOGIN=true RESCUE_HOST=root@1.2.3.4 ROOT_PART=/dev/md2 ./provision/root-keys
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+RESCUE_HOST="${RESCUE_HOST:-}"
+ROOT_PART="${ROOT_PART:-}"
+SSH_KEY="${SSH_KEY:-}"
+PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-true}"
+
+install_root_keys() {
+    local rescue_host="${1:-$RESCUE_HOST}"
+
+    provision_require_host "$rescue_host" || return 1
+    if [[ -z "$ROOT_PART" ]]; then
+        echo "ROOT_PART is required (installed-system root device)." >&2
+        echo "Discover candidates with: $0 --list-parts" >&2
+        return 1
+    fi
+
+    local pubkeys key_count keys_b64
+    pubkeys="$(collect_local_pubkeys)" || return 1
+    key_count="$(printf '%s\n' "$pubkeys" | grep -cve '^[[:space:]]*$' || true)"
+    keys_b64="$(printf '%s\n' "$pubkeys" | base64 -w0 2>/dev/null || printf '%s\n' "$pubkeys" | base64)"
+
+    echo "Installing $key_count key(s) for root on $rescue_host (root=$ROOT_PART)..."
+
+    provision_ssh "$rescue_host" \
+        "ROOT_PART='$ROOT_PART' PERMIT_ROOT_LOGIN='$PERMIT_ROOT_LOGIN' KEYS_B64='$keys_b64' bash -s" <<'REMOTE'
+set -euo pipefail
+: "${ROOT_PART:?}"
+
+if ! mountpoint -q /mnt; then
+    mount "$ROOT_PART" /mnt
+fi
+
+install -d -m 700 /mnt/root/.ssh
+printf '%s' "$KEYS_B64" | base64 -d > /mnt/root/.ssh/authorized_keys
+chmod 600 /mnt/root/.ssh/authorized_keys
+chown -R root:root /mnt/root/.ssh
+
+installed="$(grep -cve '^[[:space:]]*$' /mnt/root/.ssh/authorized_keys || true)"
+echo "  installed $installed key(s) -> /root/.ssh/authorized_keys"
+
+if [[ "${PERMIT_ROOT_LOGIN:-true}" == "true" ]]; then
+    CFG=/mnt/etc/ssh/sshd_config
+    cp -a "$CFG" "$CFG.bak.$(cat /proc/sys/kernel/random/uuid | cut -c1-8)" 2>/dev/null || cp -a "$CFG" "$CFG.bak"
+    sed -i -E 's/^([[:space:]]*PermitRootLogin[[:space:]].*)$/#\1/I' "$CFG"
+    echo "PermitRootLogin prohibit-password" >> "$CFG"
+    shopt -s nullglob
+    for f in /mnt/etc/ssh/sshd_config.d/*.conf; do
+        if grep -qiE '^[[:space:]]*PermitRootLogin' "$f"; then
+            sed -i -E 's/^([[:space:]]*PermitRootLogin[[:space:]].*)$/#\1/I' "$f"
+            echo "  neutralized PermitRootLogin in $(basename "$f")"
+        fi
+    done
+    echo "  set PermitRootLogin prohibit-password"
+fi
+
+echo "Done. After reboot to disk: ssh root@<server-ip>"
+REMOTE
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    if [[ "${1:-}" == "--list-parts" ]]; then
+        host="${2:-$RESCUE_HOST}"
+        provision_require_host "$host"
+        provision_list_parts "$host"
+        exit 0
+    fi
+    install_root_keys "$@"
+fi

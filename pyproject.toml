@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hetzner-helpers"
+version = "0.2.0"
+description = "Recover locked-out Hetzner Robot dedicated servers via the webservice API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "requests>=2.28",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+hetzner-rescue = "hetzner_helpers.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hetzner_helpers*"]

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#
+# provision/reboot-to-disk — deactivate rescue and hardware-reset so the
+# installed OS boots. Thin wrapper around: hetzner-rescue reboot-to-disk
+#
+# Usage:
+#   ./provision/reboot-to-disk 12345
+#   SERVER_NUMBER=12345 ./provision/reboot-to-disk
+#   ./provision/reboot-to-disk 12345 --yes
+#
+# See docs/recovery.md
+#
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ $# -eq 0 && -z "${SERVER_NUMBER:-}" ]]; then
+    echo "Usage: $0 <server-number> [--yes] [--reset-type hw|sw|man]" >&2
+    exit 1
+fi
+
+if command -v hetzner-rescue >/dev/null 2>&1; then
+    exec hetzner-rescue reboot-to-disk "$@"
+fi
+
+# Fallback: run from the repo without install.
+export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m hetzner_helpers.cli reboot-to-disk "$@"
